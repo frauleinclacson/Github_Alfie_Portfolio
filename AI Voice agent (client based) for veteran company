@@ -1,0 +1,202 @@
+# -*- coding: utf-8 -*-
+
+from gtts import gTTS
+from groq import Groq
+import requests
+from flask import Flask, request, jsonify
+from dotenv import load_dotenv
+import os
+
+load_dotenv()
+
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+GHL_API_KEY = os.getenv("GHL_API_KEY")
+GHL_LOCATION_ID = os.getenv("GHL_LOCATION_ID")
+
+client = Groq(api_key=GROQ_API_KEY)
+
+app = Flask(__name__)
+
+
+# -----------------------------
+# Llama 2 RESPONSE
+# -----------------------------
+def llama2_response(text):
+    response = client.chat.completions.create(
+        model="llama2-70b-chat",
+        messages=[
+            {
+                "role": "system",
+                "content": (
+                    "You are a compassionate, caring, and professional assistant for a Veterans "
+                    "Disability Claims company. Your job is to help veterans understand their VA disability "
+                    "claim options, gather basic intake information, and guide them through the process.\n\n"
+
+                    "DO:\n"
+                    "- Speak respectfully and clearly.\n"
+                    "- Acknowledge the veteran's service.\n"
+                    "- Explain VA disability claims in simple terms.\n"
+                    "- Ask ONLY appropriate, non-medical intake questions such as:\n"
+                    "    - Name\n"
+                    "    - Branch of service\n"
+                    "    - Location of residence\n"
+                    "    - Years served\n"
+                    "    - Service-connected conditions\n"
+                    "    - Current VA rating (if any)\n"
+                    "    - Whether they've filed a claim before\n"
+                    "- Ask clarifying questions when needed.\n"
+                    "- Help schedule consultations and guide them to the correct next step.\n"
+                    "- Support company staff by summarizing calls, tagging leads, updating records, and preparing notes.\n"
+                    "- Stay focused on the veteran's needs and the company's procedures.\n\n"
+
+                    "DO NOT:\n"
+                    "- Give medical or legal advice.\n"
+                    "- Guarantee outcomes, disability percentages, or approvals.\n"
+                    "- Interpret medical evidence or diagnose any condition.\n"
+                    "- Imply the company represents the VA or can influence VA decisions.\n"
+                    "- Make assumptions about a veteran's health, service history, or eligibility.\n\n"
+
+                    "Tone: supportive, professional, clear, and veteran-focused."
+                )
+            },
+            {"role": "user", "content": text}
+        ]
+    )
+
+    return response.choices[0].message["content"]
+
+
+# -----------------------------
+# Text-to-Speech (gTTS)
+# -----------------------------
+def synthesize_speech(text, output_file="tts_output.mp3"):
+    """
+    Convert text into compassionate, veteran-aware speech using gTTS.
+    """
+    final_text = (
+        "Thank you for your honorable service. "
+        "Here at Veterans Benefits Incorporated, we are committed to helping you with your VA disability claim. "
+        + text.replace("\n", " ").strip()
+    )
+
+    try:
+        tts = gTTS(final_text, lang="en")
+        tts.save(output_file)
+        return output_file
+    except Exception as e:
+        print("TTS ERROR:", e)
+        return None
+
+
+# -----------------------------
+# Upload Audio to GoHighLevel
+# -----------------------------
+def upload_audio_to_ghl(contact_id, file_path="tts_output.mp3"):
+    """
+    Uploads the generated MP3 file to GoHighLevel as a Contact File.
+    """
+    url = "https://services.leadconnectorhq.com/contacts/files"
+
+    files = {
+        "file": ("tts_output.mp3", open(file_path, "rb"), "audio/mpeg")
+    }
+
+    data = {
+        "contactId": contact_id,
+        "locationId": GHL_LOCATION_ID
+    }
+
+    headers = {
+        "Authorization": f"Bearer {GHL_API_KEY}"
+    }
+
+    try:
+        response = requests.post(url, headers=headers, files=files, data=data)
+        return response.json()
+    except Exception as e:
+        return {"error": "Failed to contact GHL API", "details": str(e)}
+
+
+# -----------------------------
+# Full Workflow
+# -----------------------------
+def respond_with_voice(text, contact_id):
+    """
+    1. Generate veteran-focused voice.
+    2. Upload to GoHighLevel.
+    """
+    audio_file = synthesize_speech(text)
+
+    if not audio_file:
+        return {"error": "Failed to generate speech output."}
+
+    ghl_upload = upload_audio_to_ghl(contact_id, audio_file)
+
+    return {
+        "message": "Voice message created and uploaded to GHL.",
+        "audio_file": audio_file,
+        "ghl_upload_result": ghl_upload
+    }
+
+
+# -----------------------------
+# UPSERT CONTACT (Create / Update)
+# -----------------------------
+def ghl_upsert_contact(first_name, phone):
+    url = "https://services.leadconnectorhq.com/contacts/"
+    headers = {
+        "Authorization": f"Bearer {GHL_API_KEY}",
+        "Version": "2021-07-28",
+        "Content-Type": "application/json"
+    }
+
+    payload = {
+        "locationId": GHL_LOCATION_ID,
+        "firstName": first_name,
+        "phone": phone
+    }
+
+    try:
+        response = requests.post(url, headers=headers, json=payload)
+        return response.json()
+    except Exception as e:
+        return {"error": str(e)}
+
+
+# -----------------------------
+# FLASK ROUTE
+# -----------------------------
+@app.route("/webhook/inbound_call", methods=["POST"])
+def inbound_call():
+    """
+    Triggered when a veteran contacts your company.
+    """
+    data = request.json
+    caller_number = data.get("from", "").strip()
+    caller_name = data.get("name", "Veteran")
+
+    # Create or update contact in GHL
+    contact_result = ghl_upsert_contact(caller_name, caller_number)
+    contact_id = contact_result.get("contact", {}).get("id")
+
+    # Generate AI text response
+    ai_text = llama2_response(
+        "Hello, thank you so much for contacting Veterans Benefits Incorporated. How may we assist you today?"
+    )
+
+    # Convert to audio + upload to GHL
+    respond_with_voice(ai_text, contact_id)
+
+    return jsonify({
+        "success": True,
+        "caller_number": caller_number,
+        "ai_text": ai_text,
+        "ghl_contact_result": contact_result
+    })
+
+
+# -----------------------------
+# RUN FLASK SERVER
+# -----------------------------
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=5006, debug=True)
